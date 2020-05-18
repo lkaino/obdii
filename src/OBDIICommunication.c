@@ -1,362 +1,179 @@
-#include "OBDIICommunication.h"
-#include "OBDIIDaemon.h"
-#include <stdlib.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/types.h>
-#include <net/if.h>
-#include <unistd.h>
-#include <string.h>
+// ****************************************************************************
+// *                               INCLUDES                                   *
+// ****************************************************************************
+#include <Arduino.h>
 #include <stdio.h>
-#include <errno.h>
-#include <sys/file.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "driver/can.h"
 
-#define MAX_ISOTP_PAYLOAD 4095
+#include "laukan/laukan_can.h"
+#include "obd2.h"
+#include "OBDII.h"
 
-// Used for communicating with the daemon
-static int daemonSocket = -1;
+// ****************************************************************************
+// *                     CONSTANTS AND TYPE DEFINITIONS                       *
+// ****************************************************************************
+#define NUM_OF_RECEIVE_MESSAGES_TO_BUFFER 10
+#define TRANSMIT_TIMEOUT_MS 50
+#define RESPONSE_TIMEOUT_MS 100
 
-static inline void pack(unsigned char **buffer, void *data, int len) {
-	if (!buffer) {
-		return;
-	}
+// ****************************************************************************
+// *                                GLOBALS                                   *
+// ****************************************************************************
+static bool gbInitialized = false;
+static laukan_canProtocolHandle gProtocolHandle;
+// Use the broadcast address as default
+static laukan_canProtocolHandle gTransmitCANID = 0x7DF;
+static laukan_canProtocolHandle gResponseCANID = 0x7E8;
+static can_message_t gMultiPartQueryMessage;
 
-	memcpy(*buffer, data, len);
-	*buffer += len;
-}
+// ****************************************************************************
+// *                     INTERNAL FUNCTIONS PROTOTYPES                        *
+// ****************************************************************************
 
-static int setupDaemonCommunication() {
-	if (daemonSocket != -1) {
-		return 0;
-	}	
-
-	struct sockaddr_un daemonAddr, selfAddr;
-	if ((daemonSocket = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
-		goto err;
-	}
-
-	memset(&selfAddr, 0, sizeof(struct sockaddr_un));
-	selfAddr.sun_family = AF_UNIX;
-	snprintf(selfAddr.sun_path, sizeof(selfAddr.sun_path), "/tmp/obdii.%ld", (long)getpid());
-
-	if (unlink(selfAddr.sun_path) < 0 && errno != ENOENT) {
-		goto err;
-	}
-
-	if (bind(daemonSocket, (struct sockaddr *)&selfAddr, sizeof(struct sockaddr_un)) < 0) {
-		goto err;
-	}
-
-	memset(&daemonAddr, 0, sizeof(struct sockaddr_un));
-	daemonAddr.sun_family = AF_UNIX;
-	strncpy(daemonAddr.sun_path, OBDII_DAEMON_SOCKET_PATH, sizeof(daemonAddr.sun_path) - 1);
-
-	// Even though this is a connection-less socket, by using connect we can use send and recv calls instead of sendto/recvfrom
-	if (connect(daemonSocket, (struct sockaddr *)&daemonAddr, sizeof(struct sockaddr_un)) < 0) {
-		goto err;
-	}
-
-	return 0;
-
-err:
-	daemonSocket = -1;
-	return -1;
-}
-
-int receiveFD(int s, int *fd)
+// ****************************************************************************
+// *                         FUNCTION DEFINITIONS                             *
+// ****************************************************************************
+OBD2Ret_e OBD2Init(void)
 {
-	if (!s) {
-		return 0;
-	}
+    OBD2Ret_e ret = OBD2_RET_OK;
+    if (gbInitialized)
+    {
+        ret = OBD2_RET_ALREADY_INITIALIZED;
+    }
 
-	struct msghdr msg = {0};
-	struct cmsghdr *cmsg;
-	
-	char buf[CMSG_SPACE(sizeof(int))];
+    if (ret == OBD2_RET_OK)
+    {
+        gMultiPartQueryMessage.identifier = gTransmitCANID;
+        gMultiPartQueryMessage.data_length_code = 8;
+        gMultiPartQueryMessage.data[0] = 0x30;
+        memset(&gMultiPartQueryMessage.data[1], 0, sizeof(gMultiPartQueryMessage) - 1);
+        gMultiPartQueryMessage.flags = CAN_MSG_FLAG_NONE;
 
-	msg.msg_control = buf;
-	msg.msg_controllen = sizeof(buf);
+        const uint32_t CANIDMask = 0x0700;
+        const uint32_t CANIDValue = CANIDMask;
+        laukan_CANRet_e canRet = laukan_canRegisterProtocol(&gProtocolHandle,
+                                                            NUM_OF_RECEIVE_MESSAGES_TO_BUFFER,
+                                                            CANIDMask,
+                                                            CANIDValue);
+        if (canRet != LAUKAN_CAN_RET_OK)
+        {
+            Serial.printf("Failed to register OBD2 protocol (%d)!\n");
+        }
+    }
 
-	if (recvmsg(s, &msg, 0) < 0) {
-		return -1;
-	}
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-
-	*fd = *(int *)CMSG_DATA(cmsg);
-
-	return 0;
+    return ret;
 }
 
-int requestRemoteSocket(OBDIISocket *obdiiSocket, int shouldOpen) {
-	if (setupDaemonCommunication() < 0) {
-		return -1;
-	}
-
-	// Send a request to the daemon to open/close a socket on our behalf
-	uint16_t apiVersion = OBDII_API_VERSION;
-	uint16_t requestType = (shouldOpen) ? OBDIIDaemonRequestOpenSocket : OBDIIDaemonRequestCloseSocket;
-
-	// Marshal the request parameters
-	unsigned char request[16];
-	unsigned char *p = request;
-
-	pack(&p, &apiVersion, sizeof(apiVersion));
-	pack(&p, &requestType, sizeof(requestType));
-	pack(&p, &obdiiSocket->ifindex, sizeof(obdiiSocket->ifindex));
-	pack(&p, &obdiiSocket->tid, sizeof(obdiiSocket->tid));
-	pack(&p, &obdiiSocket->rid, sizeof(obdiiSocket->rid));
-
-	// Send the request
-	if (send(daemonSocket, request, sizeof(request), 0) != sizeof(request)) {
-		return -1;
-	}
-
-	// Receive the response
-	uint16_t responseCode;
-	if (recv(daemonSocket, &responseCode, sizeof(responseCode), 0) != sizeof(responseCode)) {
-		return -1;
-	}
-
-	if (responseCode != OBDIIDaemonResponseCodeSuccess) {
-		return -1;
-	}
-
-	if (shouldOpen) {
-		// Receive the socket
-		if (receiveFD(daemonSocket, &obdiiSocket->s) < 0) {
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-int OBDIIOpenSocket(OBDIISocket *obdiiSocket, const char *ifname, canid_t tx_id, canid_t rx_id, int shared)
+OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
 {
-	unsigned int ifindex = if_nametoindex(ifname);
+    OBDIIResponse response = {0};
+    response.command = command;
+    bool bStatusOK = true;
 
-	if (ifindex == 0) {
-		return -1;
-	}
+    if (gbInitialized)
+    {
+        can_message_t queryMessage;
+        queryMessage.identifier = gTransmitCANID;
+        queryMessage.flags = CAN_MSG_FLAG_NONE;
+        queryMessage.data_length_code = 8;
 
-	obdiiSocket->ifindex = ifindex;
-	obdiiSocket->tid = tx_id;
-	obdiiSocket->rid = rx_id;
-	obdiiSocket->shared = shared;
+        uint8_t commandLength = sizeof(command->payload);
+        queryMessage.data[0] = commandLength;
+        memcpy(&queryMessage.data[1], command->payload, commandLength);
+        memset(&queryMessage.data[1 + commandLength], 0, 8 - commandLength - 1);
 
-	if (shared) {
-		return requestRemoteSocket(obdiiSocket, 1);
-	} else {
-		struct sockaddr_can addr;
-		addr.can_addr.tp.tx_id = tx_id;
-		addr.can_addr.tp.rx_id = rx_id;
-		addr.can_family = AF_CAN;
-		addr.can_ifindex = ifindex;
+        if (laukan_canSend(&queryMessage, TRANSMIT_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+        {
+            bStatusOK = false;
+        }
+    }
+    else
+    {
+        bStatusOK = false;
+    }
 
-		if ((obdiiSocket->s = socket(PF_CAN, SOCK_DGRAM, CAN_ISOTP)) < 0) {
-			return -1;
-		}
+    if (bStatusOK)
+    {
+        can_message_t rxMessage;
+        bool multiPart = false;
+        uint8_t payloadLen = 0;
 
-		if (bind(obdiiSocket->s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-			close(obdiiSocket->s);
-			return -1;
-		}
+        if (laukan_canReceive(gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+        {
+            // We expect all frames to contain 8 bytes
+            if (rxMessage.data_length_code == 8)
+            {
+                uint8_t index = 0;
 
-		obdiiSocket->shared = 0;
-	}
+                if (rxMessage.data[index] == 0x10)
+                {
+                    // Multipart frame
+                    multiPart = true;
+                    index++;
+                }
+                payloadLen = rxMessage.data[index++];
+                if (!multiPart)
+                {
+                    response = OBDIIDecodeResponseForCommand(command, &rxMessage.data[index], payloadLen);
+                }
+                else
+                {
+                    uint8_t payloadIndex = 0;
+                    uint8_t payload[payloadLen];
 
-	return 0;
-}
+                    const uint8_t dataLenInFirstFrame = rxMessage.data_length_code - index;
+                    memcpy(&payload[payloadIndex], &rxMessage.data[index], dataLenInFirstFrame);
+                    payloadIndex += dataLenInFirstFrame;
+                    if (laukan_canSend(&gMultiPartQueryMessage, TRANSMIT_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+                    {
+                        bStatusOK = false;
+                    }
+                    else
+                    {
+                        uint32_t frameCounter = 1;
+                        while ((payloadIndex < payloadLen) &&
+                               (gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+                        {
+                            index = 0;
+                            if ((rxMessage.data_length_code == 8) &&
+                                (rxMessage.data[index++] == (0x20 + frameCounter)))
+                            {
+                                uint32_t copyLen = rxMessage.data_length_code - index;
+                                if (payloadIndex + copyLen > payloadLen)
+                                {
+                                    // Last frame with extra bytes in the end
+                                    copyLen = payloadLen - payloadIndex;
+                                }
+                                memcpy(&payload[payloadIndex], &rxMessage.data[index], copyLen);
+                                payloadIndex += copyLen;
+                            }
+                            else
+                            {
+                                // We expect all frames to contain 8 bytes
+                                bStatusOK = false;
+                                break;
+                            }
 
-int OBDIICloseSocket(OBDIISocket *s)
-{
-	if (!s) {
-		return 0;
-	}
+                            frameCounter++;
+                        }
 
-	if (s->shared) {
-		return requestRemoteSocket(s, 0);
-	} else {
-		return close(s->s);
-	}
-}
+                        if (bStatusOK)
+                        {
+                            response = OBDIIDecodeResponseForCommand(command, payload, payloadLen);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-// Counts # bits set in the argument
-// Code from Kernighan
-static inline unsigned int _BitsSet(unsigned int word)
-{
-	unsigned int c; // c accumulates the total bits set in v
-	for (c = 0; word; c++)
-	{
-	  word &= word - 1; // clear the least significant bit set
-	}
-	return c;
-}
-
-OBDIICommandSet OBDIIGetSupportedCommands(OBDIISocket *socket)
-{
-	OBDIICommandSet supportedCommands = { 0 };
-	unsigned int numCommands;
-
-	// Mode 1
-	OBDIIResponse response = OBDIIPerformQuery(socket, OBDIICommands.mode1SupportedPIDs_1_to_20);
-
-	supportedCommands._mode1SupportedPIDs._1_to_20 = response.bitfieldValue;
-
-	// If PID 0x20 is supported, we can query the next set of PIDs
-	if (!(response.bitfieldValue & 0x01)) {
-		goto mode9;
-	}
-
-	response = OBDIIPerformQuery(socket, OBDIICommands.mode1SupportedPIDs_21_to_40);
-
-	supportedCommands._mode1SupportedPIDs._21_to_40 = response.bitfieldValue;
-
-	// If PID 0x40 is supported, we can query the next set of PIDs
-	if (!(response.bitfieldValue & 0x01)) {
-		goto mode9;
-	}
-
-	response = OBDIIPerformQuery(socket, OBDIICommands.mode1SupportedPIDs_41_to_60);
-
-	// Mask out the rest of the PIDs, because they're not yet implemented
-	response.bitfieldValue &= 0xFFFC0000;
-
-	supportedCommands._mode1SupportedPIDs._41_to_60 = response.bitfieldValue;
-
-	//// If PID 0x60 is supported, we can query the next set of commands
-	//if (!(response.bitfieldValue & 0x01)) {
-	//	goto mode9;
-	//}
-
-	//response = OBDIIPerformQuery(socket, OBDIICommands.mode1SupportedPIDs_61_to_80);
-
-	//supportedCommands._mode1SupportedPIDs._61_to_80 = response.bitfieldValue;
-
-mode9:
-	// Mode 9
-	response = OBDIIPerformQuery(socket, OBDIICommands.mode9SupportedPIDs);
-
-	// Mask out the PIDs that are not yet implemented
-	response.bitfieldValue &= 0xE0000000;
-
-	supportedCommands._mode9SupportedPIDs = response.bitfieldValue;
-
-exit:
-	numCommands = _BitsSet(supportedCommands._mode1SupportedPIDs._1_to_20) + _BitsSet(supportedCommands._mode1SupportedPIDs._21_to_40) + _BitsSet(supportedCommands._mode1SupportedPIDs._41_to_60) + _BitsSet(supportedCommands._mode1SupportedPIDs._61_to_80) + _BitsSet(supportedCommands._mode9SupportedPIDs);
-
-	numCommands += 2; // mode 1, pid 0 and mode 9, pid 0
-
-	numCommands++; // mode 3
-
-	OBDIICommand **commands = malloc(sizeof(OBDIICommand *) * numCommands);
-	if (commands != NULL) {
-		supportedCommands.commands = commands;
-		supportedCommands.numCommands = numCommands;
-
-		// Mode 1
-		unsigned int pid;
-		for (pid = 0; pid < sizeof(OBDIIMode1Commands) / sizeof(OBDIIMode1Commands[0]); ++pid) {
-			OBDIICommand *command = &OBDIIMode1Commands[pid];
-			if (OBDIICommandSetContainsCommand(&supportedCommands, command)) {
-				*commands = command;
-				++commands;
-			}
-		}
-
-		// Mode 3
-		*commands = OBDIICommands.DTCs;
-		++commands;
-
-		// Mode 9
-		for (pid = 0; pid < sizeof(OBDIIMode9Commands) / sizeof(OBDIIMode9Commands[0]); ++pid) {
-			OBDIICommand *command = &OBDIIMode9Commands[pid];
-			if (OBDIICommandSetContainsCommand(&supportedCommands, command)) {
-				*commands = command;
-				++commands;
-			}
-		}
-	}
-
-	return supportedCommands;
-}
-
-void OBDIICommandSetFree(OBDIICommandSet *commandSet) {
-	if (commandSet && commandSet->commands) {
-		free(commandSet->commands);
-	}
-}
-
-static int inline LockIfNecessary(OBDIISocket *socket) {
-	if (!socket) {
-		return 0;
-	}
-
-	if (socket->shared) {
-		// This socket is shared by multiple processes, so acquire a lock
-		return flock(socket->s, LOCK_EX);
-	}
-
-	return 0;
-}
-
-static int inline UnlockIfNecessary(OBDIISocket *socket) {
-	if (!socket) {
-		return 0;
-	}
-
-	if (socket->shared) {
-		return flock(socket->s, LOCK_UN);
-	}
-
-	return 0;
-}
-
-OBDIIResponse OBDIIPerformQuery(OBDIISocket *socket, OBDIICommand *command)
-{
-	OBDIIResponse response = { 0 };
-	response.command = command;
-
-	if (!socket) {
-		return response;
-	}
-
-	LockIfNecessary(socket);
-
-	// Send the command
-	int retval = write(socket->s, command->payload, sizeof(command->payload));
-	if (retval < 0 || retval != sizeof(command->payload)) {
-		UnlockIfNecessary(socket);
-		return response;
-	}
-
-	// Set a one second timeout
-	struct timeval timeout;
-	timeout.tv_sec = 1;
-	timeout.tv_usec = 0;
-
-	fd_set readFDs;
-	FD_ZERO(&readFDs);
-	FD_SET(socket->s, &readFDs);
-
-	if (select(socket->s + 1, &readFDs, NULL, NULL, &timeout) <= 0) {
-	    // Either we timed out, or there was an error
-	    UnlockIfNecessary(socket);
-	    return response;
-	}
-
-	// Receive the response
-	int responseLength = command->expectedResponseLength == VARIABLE_RESPONSE_LENGTH ? MAX_ISOTP_PAYLOAD : command->expectedResponseLength;
-	unsigned char responsePayload[responseLength];
-	retval = read(socket->s, responsePayload, responseLength);
-
-	if (retval < 0 || (command->expectedResponseLength != VARIABLE_RESPONSE_LENGTH && retval != command->expectedResponseLength)) {
-		UnlockIfNecessary(socket);
-		return response;
-	}
-
-	UnlockIfNecessary(socket);
-	return OBDIIDecodeResponseForCommand(command, responsePayload, retval);
+    return response;
 }
