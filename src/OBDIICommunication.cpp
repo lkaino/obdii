@@ -28,8 +28,8 @@
 static bool gbInitialized = false;
 static laukan_canProtocolHandle gProtocolHandle;
 // Use the broadcast address as default
-static laukan_canProtocolHandle gTransmitCANID = 0x7DF;
-static laukan_canProtocolHandle gResponseCANID = 0x7E8;
+static uint32_t gTransmitCANID = 0x7DF;
+static uint32_t gResponseCANID = 0x7E8;
 static can_message_t gMultiPartQueryMessage;
 
 // ****************************************************************************
@@ -63,11 +63,23 @@ OBDIIRet_e OBDIIInit(void)
                                                             CANIDValue);
         if (canRet != LAUKAN_CAN_RET_OK)
         {
-            Serial.printf("Failed to register OBD2 protocol (%d)!\n");
+            Serial.printf("Failed to register OBD2 protocol (%d)!\n", canRet);
         }
     }
 
     return ret;
+}
+
+// Counts # bits set in the argument
+// Code from Kernighan
+static inline unsigned int _BitsSet(unsigned int word)
+{
+    unsigned int c; // c accumulates the total bits set in v
+    for (c = 0; word; c++)
+    {
+        word &= word - 1; // clear the least significant bit set
+    }
+    return c;
 }
 
 OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
@@ -107,7 +119,7 @@ OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
         if (laukan_canReceive(gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
         {
             // We expect all frames to contain 8 bytes
-            if (rxMessage.data_length_code == 8)
+            if ((rxMessage.data_length_code) == 8 && (rxMessage.identifier == gResponseCANID))
             {
                 uint8_t index = 0;
 
@@ -138,7 +150,7 @@ OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
                     {
                         uint32_t frameCounter = 1;
                         while ((payloadIndex < payloadLen) &&
-                               (gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+                               laukan_canReceive(gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
                         {
                             index = 0;
                             if ((rxMessage.data_length_code == 8) &&
@@ -174,4 +186,98 @@ OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
     }
 
     return response;
+}
+
+OBDIICommandSet OBDIIGetSupportedCommands()
+{
+    OBDIICommandSet supportedCommands = {0};
+    unsigned int numCommands;
+
+    // Mode 1
+    OBDIIResponse response = OBDIIPerformQuery(OBDIICommands.mode1SupportedPIDs_1_to_20);
+
+    supportedCommands._mode1SupportedPIDs._1_to_20 = response.bitfieldValue;
+
+    // If PID 0x20 is supported, we can query the next set of PIDs
+    if (!(response.bitfieldValue & 0x01))
+    {
+        goto mode9;
+    }
+
+    response = OBDIIPerformQuery(OBDIICommands.mode1SupportedPIDs_21_to_40);
+
+    supportedCommands._mode1SupportedPIDs._21_to_40 = response.bitfieldValue;
+
+    // If PID 0x40 is supported, we can query the next set of PIDs
+    if (!(response.bitfieldValue & 0x01))
+    {
+        goto mode9;
+    }
+
+    response = OBDIIPerformQuery(OBDIICommands.mode1SupportedPIDs_41_to_60);
+
+    // Mask out the rest of the PIDs, because they're not yet implemented
+    response.bitfieldValue &= 0xFFFC0000;
+
+    supportedCommands._mode1SupportedPIDs._41_to_60 = response.bitfieldValue;
+
+    //// If PID 0x60 is supported, we can query the next set of commands
+    //if (!(response.bitfieldValue & 0x01)) {
+    //	goto mode9;
+    //}
+
+    //response = OBDIIPerformQuery(socket, OBDIICommands.mode1SupportedPIDs_61_to_80);
+
+    //supportedCommands._mode1SupportedPIDs._61_to_80 = response.bitfieldValue;
+
+mode9:
+    // Mode 9
+    response = OBDIIPerformQuery(OBDIICommands.mode9SupportedPIDs);
+
+    // Mask out the PIDs that are not yet implemented
+    response.bitfieldValue &= 0xE0000000;
+
+    supportedCommands._mode9SupportedPIDs = response.bitfieldValue;
+
+    numCommands = _BitsSet(supportedCommands._mode1SupportedPIDs._1_to_20) + _BitsSet(supportedCommands._mode1SupportedPIDs._21_to_40) + _BitsSet(supportedCommands._mode1SupportedPIDs._41_to_60) + _BitsSet(supportedCommands._mode1SupportedPIDs._61_to_80) + _BitsSet(supportedCommands._mode9SupportedPIDs);
+
+    numCommands += 2; // mode 1, pid 0 and mode 9, pid 0
+
+    numCommands++; // mode 3
+
+    OBDIICommand **commands = (OBDIICommand **)malloc(sizeof(OBDIICommand *) * numCommands);
+    if (commands != NULL)
+    {
+        supportedCommands.commands = commands;
+        supportedCommands.numCommands = numCommands;
+
+        // Mode 1
+        unsigned int pid;
+        for (pid = 0; pid < sizeof(OBDIIMode1Commands) / sizeof(OBDIIMode1Commands[0]); ++pid)
+        {
+            OBDIICommand *command = &OBDIIMode1Commands[pid];
+            if (OBDIICommandSetContainsCommand(&supportedCommands, command))
+            {
+                *commands = command;
+                ++commands;
+            }
+        }
+
+        // Mode 3
+        *commands = OBDIICommands.DTCs;
+        ++commands;
+
+        // Mode 9
+        for (pid = 0; pid < sizeof(OBDIIMode9Commands) / sizeof(OBDIIMode9Commands[0]); ++pid)
+        {
+            OBDIICommand *command = &OBDIIMode9Commands[pid];
+            if (OBDIICommandSetContainsCommand(&supportedCommands, command))
+            {
+                *commands = command;
+                ++commands;
+            }
+        }
+    }
+
+    return supportedCommands;
 }
