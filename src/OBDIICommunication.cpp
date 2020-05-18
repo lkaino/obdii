@@ -2,8 +2,6 @@
 // *                               INCLUDES                                   *
 // ****************************************************************************
 #include <Arduino.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -13,9 +11,9 @@
 #include "esp_log.h"
 #include "driver/can.h"
 
-#include "laukan/laukan_can.h"
-#include "obd2.h"
+#include "laukan_can.h"
 #include "OBDII.h"
+#include "OBDIICommunication.h"
 
 // ****************************************************************************
 // *                     CONSTANTS AND TYPE DEFINITIONS                       *
@@ -41,9 +39,9 @@ static can_message_t gMultiPartQueryMessage;
 // ****************************************************************************
 // *                         FUNCTION DEFINITIONS                             *
 // ****************************************************************************
-OBD2Ret_e OBD2Init(void)
+OBDIIRet_e OBDIIInit(void)
 {
-    OBD2Ret_e ret = OBD2_RET_OK;
+    OBDIIRet_e ret = OBD2_RET_OK;
     if (gbInitialized)
     {
         ret = OBD2_RET_ALREADY_INITIALIZED;
