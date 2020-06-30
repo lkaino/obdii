@@ -26,7 +26,7 @@
 // *                                GLOBALS                                   *
 // ****************************************************************************
 static bool gbInitialized = false;
-static laukan_canProtocolHandle gProtocolHandle;
+static ln_canProtocolHandle gProtocolHandle;
 // Use the broadcast address as default
 static uint32_t gTransmitCANID = 0x7DF;
 static uint32_t gResponseCANID = 0x7E8;
@@ -57,10 +57,10 @@ OBDIIRet_e OBDIIInit(void)
 
         const uint32_t CANIDMask = 0x0700;
         const uint32_t CANIDValue = CANIDMask;
-        laukan_CANRet_e canRet = laukan_canRegisterProtocol(&gProtocolHandle,
-                                                            NUM_OF_RECEIVE_MESSAGES_TO_BUFFER,
-                                                            CANIDMask,
-                                                            CANIDValue);
+        ln_CANRet_e canRet = ln_canRegisterProtocol(&gProtocolHandle,
+                                                    NUM_OF_RECEIVE_MESSAGES_TO_BUFFER,
+                                                    CANIDMask,
+                                                    CANIDValue);
         if (canRet != LAUKAN_CAN_RET_OK)
         {
             Serial.printf("Failed to register OBD2 protocol (%d)!\n", canRet);
@@ -100,7 +100,7 @@ OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
         memcpy(&queryMessage.data[1], command->payload, commandLength);
         memset(&queryMessage.data[1 + commandLength], 0, 8 - commandLength - 1);
 
-        if (laukan_canSend(&queryMessage, TRANSMIT_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+        if (ln_canSend(&queryMessage, TRANSMIT_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
         {
             bStatusOK = false;
         }
@@ -116,7 +116,7 @@ OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
         bool multiPart = false;
         uint8_t payloadLen = 0;
 
-        if (laukan_canReceive(gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+        if (ln_canReceive(gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
         {
             // We expect all frames to contain 8 bytes
             if ((rxMessage.data_length_code) == 8 && (rxMessage.identifier == gResponseCANID))
@@ -142,7 +142,7 @@ OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
                     const uint8_t dataLenInFirstFrame = rxMessage.data_length_code - index;
                     memcpy(&payload[payloadIndex], &rxMessage.data[index], dataLenInFirstFrame);
                     payloadIndex += dataLenInFirstFrame;
-                    if (laukan_canSend(&gMultiPartQueryMessage, TRANSMIT_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+                    if (ln_canSend(&gMultiPartQueryMessage, TRANSMIT_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
                     {
                         bStatusOK = false;
                     }
@@ -150,7 +150,7 @@ OBDIIResponse OBDIIPerformQuery(OBDIICommand *command)
                     {
                         uint32_t frameCounter = 1;
                         while ((payloadIndex < payloadLen) &&
-                               laukan_canReceive(gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
+                               ln_canReceive(gProtocolHandle, &rxMessage, RESPONSE_TIMEOUT_MS) == LAUKAN_CAN_RET_OK)
                         {
                             index = 0;
                             if ((rxMessage.data_length_code == 8) &&
